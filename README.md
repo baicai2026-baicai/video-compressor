@@ -2,6 +2,10 @@
 
 面向 Windows 的中文视频压缩工具，支持批量输出 MP4，也可以在双显卡电脑上指定显卡。默认用 CPU 的 H.265 慢速编码，保留原分辨率和帧率，适合画质优先的场景。
 
+## 下载
+
+前往 [最新 Windows 发行版](https://github.com/baicai2026-baicai/video-compressor/releases/latest)，下载 Windows ZIP，解压整个文件夹，双击其中的 `视频压缩工具.exe` 即可。无需安装 Python；请将压缩包内的 FFmpeg 工具与程序保留在同一文件夹。
+
 ## 主要功能
 
 - 多选视频批量压缩，可指定输出文件夹。默认在各原文件所在位置生成 `原文件名_compressed.mp4`；遇到同名文件会自动编号，不覆盖文件。
@@ -12,7 +16,7 @@
 
 **“视觉无损”不等于数学无损。** 建议先用一段代表性素材试压，再比对细节和文件体积。压缩后不保证一定更小；工具发现体积增大时会提示，不会删除原文件。
 
-## Windows 安装和使用
+## 从源码运行
 
 1. 从 [Gyan.dev FFmpeg builds](https://www.gyan.dev/ffmpeg/builds/) 下载较新的 **release full build**（`ffmpeg-release-full.7z`）。
 2. 解压，从 `bin` 复制 `ffmpeg.exe` 和 `ffprobe.exe`，将它们放到 `video_compressor.py` 或 `video_compressor.exe` 同一目录，也可将 FFmpeg 的 `bin` 目录加入 PATH。
@@ -22,7 +26,6 @@
    python video_compressor.py
    ```
 
-   如果已有打包好的 EXE，直接双击即可，不需要安装 Python。
 4. 点击「添加视频」，选择画质和编码器，再点击「开始压缩」。播放设备不支持 H.265 时，可以用 H.264。
 
 ## 双显卡怎么选？
@@ -46,11 +49,6 @@ EXE 在 `dist\video_compressor.exe`。FFmpeg 工具不打进程序 EXE，运行�
 
 本地运行 `python -m unittest -v`。实际编码测试需要 PATH 中有近期版本的 FFmpeg（须支持 `-fps_mode`）和 ffprobe。
 
-<details>
-<summary>Linux 下早期界面示例（尚未加入显卡选择项）</summary>
-
-![视频压缩工具界面](docs/screenshot-linux.png)
-
-</details>
+![Windows 版视频压缩工具：显卡选择、批次进度和压缩结果](docs/screenshot-windows.png)
 
 许可证：[MIT](LICENSE)。
