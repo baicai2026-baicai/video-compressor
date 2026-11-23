@@ -1,0 +1,17 @@
+# FFmpeg dependencies and PyInstaller artifacts
+ffmpeg*.exe
+ffprobe*.exe
+/build/
+/dist/
+*.spec
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local encoding and test outputs
+.compress-*/
+*_compressed*.mp4
+/test-output/
+*.log
