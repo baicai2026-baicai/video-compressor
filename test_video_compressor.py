@@ -4,11 +4,15 @@ import sys
 import tempfile
 import threading
 import unittest
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from video_compressor import (
-    Batch, Cancelled, GPU, Settings, build_command, duration_seconds, encoder_probe_command, find_tool,
-    gpu_environment, parse_nvidia_gpus, selectable_dxgi_gpus,
+    Batch, Cancelled, DeviceCache, GPU, ProgressParser, Settings, build_command, check_encoder,
+    device_strategies, duration_seconds, encoder_probe_command, find_tool, gpu_environment,
+    parse_nvidia_gpus, selectable_dxgi_gpus,
 )
 
 
@@ -63,11 +67,11 @@ class CommandTests(unittest.TestCase):
         probe = {"streams": [{"index": 0, "codec_type": "video"}]}
         examples = (
             (Settings("hevc_qsv", gpu=GPU("Intel", 2, "Intel")), [
-                "-init_hw_device", "d3d11va=adapter:2",
-                "-init_hw_device", "qsv=hw@adapter", "-filter_hw_device", "hw",
+                "-init_hw_device", "d3d11va=dx:2",
+                "-init_hw_device", "qsv=hw@dx", "-filter_hw_device", "hw",
             ]),
             (Settings("hevc_amf", gpu=GPU("AMD", 1, "AMD")), [
-                "-init_hw_device", "d3d11va=adapter:1", "-filter_hw_device", "adapter",
+                "-init_hw_device", "d3d11va=dx:1",
             ]),
             (Settings("h264_nvenc", gpu=GPU("NVIDIA", 1, "GeForce", "GPU-5678-efab")), [
                 "-gpu", "0",
@@ -75,15 +79,108 @@ class CommandTests(unittest.TestCase):
         )
         for settings, expected in examples:
             with self.subTest(encoder=settings.encoder):
-                for command in (encoder_probe_command("ffmpeg", settings),
-                                build_command("ffmpeg", "in.mkv", "out.mp4", probe, settings)):
+                strategy = device_strategies(settings)[0]
+                probe_command = encoder_probe_command("ffmpeg", settings, strategy)
+                self.assertIn("color=s=1280x720:r=30", probe_command)
+                self.assertEqual(probe_command[probe_command.index("-frames:v") + 1], "5")
+                self.assertEqual(probe_command[probe_command.index("-pix_fmt") + 1], "nv12")
+                for command in (probe_command,
+                                build_command("ffmpeg", "in.mkv", "out.mp4", probe, settings, strategy)):
                     index = command.index(expected[0])
                     self.assertEqual(command[index:index + len(expected)], expected)
+                    if settings.encoder.endswith("_amf"):
+                        self.assertNotIn("-filter_hw_device", command)
                 environment = gpu_environment(settings.gpu)
                 if settings.encoder.endswith("_nvenc"):
                     self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "GPU-5678-efab")
                 else:
                     self.assertIsNone(environment)
+
+    def test_probe_fallback_caches_winner_per_encoder_and_gpu(self):
+        settings = Settings("h264_qsv", gpu=GPU("Intel", 2, "Intel"))
+        candidates = device_strategies(settings)
+        self.assertEqual([strategy.args for strategy in candidates[1:]], [
+            ("-init_hw_device", "qsv=hw:hw_any,child_device=2"),
+            ("-init_hw_device", "qsv=hw:hw_any,child_device=2,child_device_type=d3d11va"),
+            ("-init_hw_device", "qsv=hw:hw_any,child_device=2,child_device_type=dxva2"),
+            ("-qsv_device", "2"),
+            (),
+        ])
+        cache = DeviceCache()
+        fail = SimpleNamespace(returncode=1, stderr="Direct3D initialization failed")
+        success = SimpleNamespace(returncode=0, stderr="")
+        with patch("video_compressor.subprocess.run", side_effect=[fail, fail, success, success]) as run:
+            self.assertEqual(check_encoder("ffmpeg", settings, cache), (candidates[2], ""))
+            self.assertEqual(check_encoder("ffmpeg", settings, cache), (candidates[2], ""))
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                encoder_probe_command("ffmpeg", settings, candidates[index]) for index in (0, 1, 2, 2)
+            ])
+        other = Settings("hevc_qsv", gpu=settings.gpu)
+        self.assertEqual(cache.ordered("ffmpeg", other), device_strategies(other))
+        other_gpu = Settings(settings.encoder, gpu=GPU("Intel", 1, "Intel"))
+        self.assertEqual(cache.ordered("ffmpeg", other_gpu), device_strategies(other_gpu))
+
+    def test_failed_probe_returns_full_stderr_of_last_strategy(self):
+        settings = Settings("h264_amf", gpu=GPU("AMD", 1, "AMD"))
+        first = SimpleNamespace(returncode=1, stderr="D3D11 initialization failed")
+        last = SimpleNamespace(returncode=2, stderr="AMF failed\nSecond error line\n")
+        with patch("video_compressor.subprocess.run", side_effect=[first, last]) as run:
+            strategy, error = check_encoder("ffmpeg", settings, DeviceCache())
+        self.assertIsNone(strategy)
+        self.assertIn("FFmpeg 自动选卡", error)
+        self.assertTrue(error.endswith("AMF failed\nSecond error line"))
+        self.assertNotIn("-init_hw_device", run.call_args.args[0])
+
+    def test_real_encode_starts_with_cached_strategy_then_retries(self):
+        settings = Settings("h264_amf", gpu=GPU("AMD", 1, "AMD"))
+        primary, automatic = device_strategies(settings)
+        cache = DeviceCache()
+        cache.remember("ffmpeg", settings, automatic)
+        batch = Batch(cache)
+        commands = []
+
+        def run(args, consume, **_kwargs):
+            tmp = Path(args[-1])
+            self.assertFalse(tmp.exists())
+            tmp.write_bytes(b"mp4")
+            commands.append(args)
+            if len(commands) == 1:
+                consume(SimpleNamespace(stdout=StringIO("AMF failed to initialize\n")))
+                return 1, None
+            return 0, None
+
+        probe = {"streams": [{"index": 0, "codec_type": "video"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "test.mp4"
+            source.write_bytes(b"input")
+            with patch.object(batch, "probe", return_value=probe), patch.object(batch, "_run", side_effect=run):
+                output, _, _ = batch.encode("ffmpeg", "ffprobe", source, settings, lambda _: None, lambda _: None)
+            self.assertEqual(output.read_bytes(), b"mp4")
+        self.assertNotIn("-init_hw_device", commands[0])
+        self.assertIn("d3d11va=dx:1", commands[1])
+        self.assertEqual(cache.ordered("ffmpeg", settings)[0], primary)
+
+    def test_progress_report_retains_fractions_and_reports_speed_and_eta(self):
+        parser = ProgressParser(10_000)
+        self.assertEqual(parser.feed("warning: test=1"), (False, None))
+        for line in ("frame=0", "out_time_us=N/A", "speed=N/A", "progress=continue"):
+            self.assertEqual(parser.feed(line), (True, None))
+        for line in ("frame=8", "fps=12.5", "out_time_us=7500000", "speed=0.35x"):
+            self.assertEqual(parser.feed(line), (True, None))
+        handled, progress = parser.feed("progress=continue")
+        self.assertTrue(handled)
+        self.assertEqual(progress.percent, 0.075)
+        self.assertEqual(progress.fps, 12.5)
+        self.assertEqual(progress.status(), "已处理 00:00:07 / 02:46:40 · 速度 0.35x · 12.5 fps · 预计剩余 07:55:50")
+
+    def test_progress_without_known_duration_uses_clock_field(self):
+        parser = ProgressParser(0)
+        for line in ("frame=12", "out_time_us=N/A", "out_time=00:01:02.500", "speed=N/A"):
+            parser.feed(line)
+        _, progress = parser.feed("progress=end")
+        self.assertEqual(progress.elapsed, 62.5)
+        self.assertIsNone(progress.percent)
+        self.assertEqual(progress.status(), "已处理 00:01:02 / 未知 · 速度 — · 预计剩余 —")
 
     def test_missing_duration(self):
         self.assertEqual(duration_seconds({"format": {"duration": "N/A"}}), 0)
@@ -146,7 +243,7 @@ class EncodeTests(unittest.TestCase):
             self.assertEqual(before, source.stat().st_size)
             self.assertEqual(after, first.stat().st_size)
             self.assertGreater(len(progress), 1)
-            self.assertEqual(progress[-1], 100)
+            self.assertEqual(progress[-1].percent, 100)
             probed = batch.probe(ffprobe, first)
             video, audio1, audio2, subtitle = probed["streams"]
             self.assertEqual((video["width"], video["height"], video["avg_frame_rate"]),

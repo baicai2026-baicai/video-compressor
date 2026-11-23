@@ -1,5 +1,6 @@
 import ctypes
 import json
+import math
 import os
 import queue
 import re
@@ -176,13 +177,57 @@ def detect_gpus():
     return devices
 
 
-def gpu_device_args(gpu):
-    if gpu is None or gpu.vendor == "NVIDIA":
-        return []
-    args = ["-init_hw_device", f"d3d11va=adapter:{gpu.index}"]
-    if gpu.vendor == "Intel":
-        return args + ["-init_hw_device", "qsv=hw@adapter", "-filter_hw_device", "hw"]
-    return args + ["-filter_hw_device", "adapter"]
+@dataclass(frozen=True)
+class DeviceStrategy:
+    label: str
+    args: tuple[str, ...] = ()
+
+
+def device_strategies(settings):
+    gpu = settings.gpu
+    if gpu is not None:
+        index = gpu.index
+        if settings.encoder.endswith("_qsv"):
+            child = f"qsv=hw:hw_any,child_device={index}"
+            return (
+                DeviceStrategy("QSV / D3D11 派生", (
+                    "-init_hw_device", f"d3d11va=dx:{index}",
+                    "-init_hw_device", "qsv=hw@dx", "-filter_hw_device", "hw",
+                )),
+                DeviceStrategy("QSV / 默认子设备类型", ("-init_hw_device", child)),
+                DeviceStrategy("QSV / D3D11 子设备", (
+                    "-init_hw_device", f"{child},child_device_type=d3d11va",
+                )),
+                DeviceStrategy("QSV / DXVA2 子设备", (
+                    "-init_hw_device", f"{child},child_device_type=dxva2",
+                )),
+                DeviceStrategy("QSV / -qsv_device", ("-qsv_device", str(index))),
+                DeviceStrategy("FFmpeg 自动选卡"),
+            )
+        if settings.encoder.endswith("_amf"):
+            return (
+                DeviceStrategy("AMF / D3D11", ("-init_hw_device", f"d3d11va=dx:{index}")),
+                DeviceStrategy("FFmpeg 自动选卡"),
+            )
+    return (DeviceStrategy("默认设备"),)
+
+
+class DeviceCache:
+    def __init__(self):
+        self.winners = {}
+        self.lock = threading.Lock()
+
+    def ordered(self, ffmpeg, settings):
+        candidates = device_strategies(settings)
+        with self.lock:
+            winner = self.winners.get((ffmpeg, settings.encoder, settings.gpu))
+        if winner in candidates:
+            return (winner, *(candidate for candidate in candidates if candidate != winner))
+        return candidates
+
+    def remember(self, ffmpeg, settings, strategy):
+        with self.lock:
+            self.winners[ffmpeg, settings.encoder, settings.gpu] = strategy
 
 
 def gpu_environment(gpu):
@@ -194,7 +239,11 @@ def gpu_environment(gpu):
 
 def encoder_failure_hint(encoder):
     if encoder == "hevc_amf":
-        return "部分旧款 AMD 显卡（如 Radeon R7 200 系列）不支持 H.265 硬件编码。请选择 Intel 显卡或 CPU 编码。"
+        return "AMD H.265 硬件编码不可用。部分旧款 Radeon R7 200 显卡不支持 H.265；请尝试同一显卡的 H.264，或改用 CPU。"
+    if encoder == "h264_amf":
+        return "AMD H.264 硬件编码不可用。请检查显卡型号和 AMD 驱动，或改用 CPU 编码。"
+    if encoder.endswith("_qsv"):
+        return "Intel Quick Sync 硬件编码不可用。请检查 Intel 显卡驱动，尝试 H.264 或改用 CPU。"
     return "请检查显卡驱动及编码支持，或改用 CPU 编码。"
 
 
@@ -240,33 +289,50 @@ def encoder_options(settings):
     raise ValueError(f"不支持的编码器：{encoder}")
 
 
-def encoder_probe_command(ffmpeg, settings):
+def encoder_probe_command(ffmpeg, settings, strategy):
     return [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
-            *gpu_device_args(settings.gpu), "-f", "lavfi", "-i", "color=s=320x240:r=30",
-            "-an", "-frames:v", "1", "-c:v", settings.encoder, *encoder_options(settings),
+            *strategy.args, "-f", "lavfi", "-i", "color=s=1280x720:r=30",
+            "-an", "-frames:v", "5", "-pix_fmt", "nv12",
+            "-c:v", settings.encoder, *encoder_options(settings),
             "-f", "null", "-"]
 
 
-def check_encoder(ffmpeg, settings):
-    try:
-        result = subprocess.run(encoder_probe_command(ffmpeg, settings), capture_output=True,
-                                timeout=12, env=gpu_environment(settings.gpu), **HIDDEN_PROCESS)
-        return result.returncode == 0, result.stderr.strip()
-    except subprocess.TimeoutExpired:
-        return False, "硬件编码检测超时。"
-    except OSError as exc:
-        return False, str(exc)
+def check_encoder(ffmpeg, settings, cache):
+    last_error = ""
+    for strategy in cache.ordered(ffmpeg, settings):
+        try:
+            result = subprocess.run(encoder_probe_command(ffmpeg, settings, strategy), capture_output=True,
+                                    timeout=12, env=gpu_environment(settings.gpu), **HIDDEN_PROCESS)
+        except subprocess.TimeoutExpired as exc:
+            stderr = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+            last_error = f"{strategy.label}：硬件编码检测超时。"
+            if stderr:
+                last_error += f"\n{stderr}"
+        except OSError as exc:
+            return None, str(exc)
+        else:
+            if result.returncode == 0:
+                cache.remember(ffmpeg, settings, strategy)
+                return strategy, ""
+            stderr = result.stderr.strip()
+            last_error = f"{strategy.label}：FFmpeg 退出码 {result.returncode}"
+            if stderr:
+                last_error += f"\n{stderr}"
+    return None, last_error
 
 
-def build_command(ffmpeg, source, output, probe, settings):
+def build_command(ffmpeg, source, output, probe, settings, strategy=None):
     streams = probe.get("streams", [])
     videos = [s for s in streams if s["codec_type"] == "video"
               and not s.get("disposition", {}).get("attached_pic")]
     if not videos:
         raise ValueError("找不到可压缩的视频轨。")
     video = next((s for s in videos if s.get("disposition", {}).get("default")), videos[0])
+    if strategy is None:
+        strategy = device_strategies(settings)[0]
     args = [ffmpeg, "-hide_banner", "-loglevel", "warning", "-nostdin", "-n",
-            "-progress", "pipe:1", "-nostats", *gpu_device_args(settings.gpu), "-i", str(source),
+            "-progress", "pipe:1", "-stats_period", "0.25", "-nostats", *strategy.args,
+            "-i", str(source),
             "-map", f"0:{video['index']}", "-c:v", settings.encoder, *encoder_options(settings)]
     if settings.encoder == "libx265" or settings.encoder.startswith("hevc_"):
         args += ["-tag:v", "hvc1"]
@@ -293,15 +359,99 @@ def build_command(ffmpeg, source, output, probe, settings):
     return args
 
 
+def progress_number(value):
+    try:
+        number = float(value)
+        return number if math.isfinite(number) and number >= 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def progress_time(values):
+    micros = progress_number(values.get("out_time_us"))
+    if micros is not None:
+        return micros / 1_000_000
+    parts = values.get("out_time", "").split(":")
+    if len(parts) == 3:
+        hours, minutes, seconds = map(progress_number, parts)
+        if hours is not None and minutes is not None and seconds is not None:
+            return hours * 3600 + minutes * 60 + seconds
+    return 0.0
+
+
+def clock(seconds):
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+
+@dataclass(frozen=True)
+class EncodeProgress:
+    duration: float
+    elapsed: float = 0.0
+    fps: float = 0.0
+    speed: float = 0.0
+    finished: bool = False
+
+    @property
+    def percent(self):
+        if self.finished:
+            return 100.0
+        if self.duration and self.elapsed:
+            return min(99.9, 100 * self.elapsed / self.duration)
+        return None
+
+    def status(self):
+        total = clock(self.duration) if self.duration else "未知"
+        speed = f"{self.speed:.2f}x" if self.speed else "—"
+        fps = f" · {self.fps:.1f} fps" if self.fps else ""
+        remaining = "—"
+        if self.duration and self.speed:
+            eta = (max(0, self.duration - self.elapsed) / self.speed)
+            if math.isfinite(eta):
+                remaining = clock(math.ceil(eta))
+        return f"已处理 {clock(self.elapsed)} / {total} · 速度 {speed}{fps} · 预计剩余 {remaining}"
+
+
+class ProgressParser:
+    def __init__(self, duration):
+        self.duration = duration
+        self.values = {}
+        self.wrote_frames = False
+        self.elapsed = 0.0
+
+    def feed(self, line):
+        key, sep, val = line.partition("=")
+        if not sep or not (key in {
+            "frame", "fps", "bitrate", "total_size", "out_time_us", "out_time_ms", "out_time",
+            "dup_frames", "drop_frames", "speed", "progress",
+        } or re.fullmatch(r"stream_\d+_\d+_q", key)):
+            return False, None
+        self.values[key] = val.strip()
+        if key != "progress":
+            return True, None
+        values, self.values = self.values, {}
+        elapsed = progress_time(values)
+        self.elapsed = max(self.elapsed, elapsed)
+        self.wrote_frames |= bool(progress_number(values.get("frame")) or elapsed)
+        if not self.wrote_frames:
+            return True, None
+        return True, EncodeProgress(
+            self.duration, self.elapsed, progress_number(values.get("fps")) or 0.0,
+            progress_number(values.get("speed", "").removesuffix("x")) or 0.0,
+        )
+
+
 class Cancelled(Exception):
     pass
 
 
 class Batch:
-    def __init__(self):
+    def __init__(self, device_cache=None):
         self.cancelled = threading.Event()
         self.lock = threading.Lock()
         self.process = None
+        self.device_cache = device_cache if device_cache is not None else DeviceCache()
 
     def check_cancelled(self):
         if self.cancelled.is_set():
@@ -349,28 +499,35 @@ class Batch:
         def consume(process):
             for raw in process.stdout:
                 line = raw.strip()
-                key, sep, val = line.partition("=")
-                if sep and key == "out_time_us" and duration and val.lstrip("-").isdigit():
-                    progress(max(0, min(99, 100 * int(val) / 1_000_000 / duration)))
-                elif line and not (sep and key in {
-                    "frame", "fps", "stream_0_0_q", "bitrate", "total_size",
-                    "out_time_us", "out_time_ms", "out_time", "dup_frames", "drop_frames",
-                    "speed", "progress",
-                }):
+                handled, update = parser.feed(line)
+                if update is not None:
+                    progress(update)
+                elif line and not handled:
                     log(line)
 
         with tempfile.TemporaryDirectory(prefix=".compress-", dir=directory) as temp_dir:
             temp = Path(temp_dir) / "output.mp4"
-            args = build_command(ffmpeg, source, temp, probe, settings)
-            code, _ = self._run(args, consume, stderr=subprocess.STDOUT,
-                                env=gpu_environment(settings.gpu))
+            strategies = self.device_cache.ordered(ffmpeg, settings)
+            for attempt, strategy in enumerate(strategies, start=1):
+                parser = ProgressParser(duration)
+                if len(strategies) > 1:
+                    log(f"[编码] 正在使用 {strategy.label}（{attempt}/{len(strategies)}）")
+                args = build_command(ffmpeg, source, temp, probe, settings, strategy)
+                code, _ = self._run(args, consume, stderr=subprocess.STDOUT,
+                                    env=gpu_environment(settings.gpu))
+                if not code:
+                    self.device_cache.remember(ffmpeg, settings, strategy)
+                    break
+                if parser.wrote_frames or attempt == len(strategies):
+                    break
+                temp.unlink(missing_ok=True)
             if code:
                 hint = "" if settings.encoder in ("libx264", "libx265") else encoder_failure_hint(settings.encoder)
                 raise RuntimeError(f"FFmpeg 退出码：{code}。请查看日志。{hint}")
             after = temp.stat().st_size
             self.check_cancelled()
             output = publish_output(temp, directory, source.stem)
-        progress(100)
+        progress(EncodeProgress(duration, parser.elapsed, finished=True))
         return output, before, after
 
 
@@ -410,6 +567,7 @@ class App:
         self.gpu_label = tk.StringVar(value=AUTO_GPU)
         self.gpu_status = tk.StringVar(value="正在检测显卡…")
         self.gpus = {}
+        self.device_cache = DeviceCache()
         self.gpus_detected = False
         self.probe_id = 0
         self.probe_result = None
@@ -536,7 +694,10 @@ class App:
             (0, "当前文件", self.file_progress), (1, "批次进度", self.batch_progress),
         ):
             ttk.Label(activity, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8))
-            ttk.Progressbar(activity, variable=var).grid(row=row, column=1, sticky="ew", pady=3)
+            bar = ttk.Progressbar(activity, variable=var)
+            bar.grid(row=row, column=1, sticky="ew", pady=3)
+            if row == 0:
+                self.file_bar = bar
         self.log_box = ScrolledText(activity, height=3, wrap="word", state="disabled",
                                     background="#ffffff", foreground="#203452",
                                     font=(family, -round(14 * scale)))
@@ -545,11 +706,11 @@ class App:
 
         footer = ttk.Frame(body)
         footer.grid(row=3, column=0, sticky="ew", pady=(5, 0))
-        ttk.Label(footer, textvariable=self.status).pack(side="left")
         self.start_button = ttk.Button(footer, text="开始压缩", style="Accent.TButton", command=self.start)
         self.start_button.pack(side="right")
         self.cancel_button = ttk.Button(footer, text="取消任务", state="disabled", command=self.cancel)
         self.cancel_button.pack(side="right", padx=8)
+        ttk.Label(footer, textvariable=self.status).pack(side="left")
 
     def slider_changed(self, value):
         self.crf_label.set(str(round(float(value))))
@@ -594,10 +755,10 @@ class App:
 
     def probe_encoder(self, probe_id, settings):
         try:
-            result = check_encoder(find_tool("ffmpeg"), settings)
+            result = check_encoder(find_tool("ffmpeg"), settings, self.device_cache)
         except FileNotFoundError as exc:
-            result = False, str(exc)
-        self.events.put(("encoder_probe", (probe_id, settings.encoder, *result)))
+            result = None, str(exc)
+        self.events.put(("encoder_probe", (probe_id, settings, *result)))
 
     def add_files(self):
         chosen = filedialog.askopenfilenames(title="添加视频文件", filetypes=[
@@ -665,16 +826,13 @@ class App:
             if self.probe_result is None:
                 messagebox.showinfo("正在检测", "请等待硬件编码检测结束。")
                 return
-            available, details = self.probe_result
-            if not available:
-                if details:
-                    self.log(details)
+            if not self.probe_result:
                 messagebox.showerror("硬件编码不可用", encoder_failure_hint(encoder))
                 return
         settings = Settings(encoder, round(self.crf.get()), SPEEDS[self.speed.get()],
                             RESOLUTIONS[self.resolution.get()], self.output_dir,
                             self.gpus.get(self.gpu_label.get()))
-        self.batch = Batch()
+        self.batch = Batch(self.device_cache)
         self.file_progress.set(0)
         self.batch_progress.set(0)
         for row in self.files:
@@ -694,11 +852,12 @@ class App:
         for index, (row, source) in enumerate(files):
             if batch.cancelled.is_set():
                 break
-            emit("current", row, f"正在处理 {index + 1}/{len(files)}：{source.name}")
+            emit("current", row, index + 1, len(files), source.name)
             try:
                 output, before, after = batch.encode(
                     ffmpeg, ffprobe, source, settings,
-                    lambda value: emit("progress", value, (index + value / 100) * 100 / len(files)),
+                    lambda update: emit("progress", update, (index + (update.percent or 0) / 100)
+                                        * 100 / len(files)),
                     lambda line: emit("log", line),
                 )
             except Cancelled:
@@ -708,7 +867,7 @@ class App:
                 failures += 1
                 emit("row", row, "失败")
                 emit("log", f"失败：{source.name}：{exc}")
-                emit("progress", 0, (index + 1) * 100 / len(files))
+                emit("progress", None, (index + 1) * 100 / len(files))
             else:
                 successes += 1
                 larger += after > before
@@ -717,6 +876,18 @@ class App:
                 if after > before:
                     emit("log", "提示：压缩后比原文件大，两个文件均已保留。")
         emit("done", batch.cancelled.is_set(), successes, failures, larger)
+
+    def update_file_bar(self, value):
+        if value is None:
+            if self.file_bar.cget("mode") != "indeterminate":
+                self.file_bar.configure(mode="indeterminate")
+                self.file_progress.set(0)
+                self.file_bar.start(65)
+        else:
+            if self.file_bar.cget("mode") != "determinate":
+                self.file_bar.stop()
+                self.file_bar.configure(mode="determinate")
+            self.file_progress.set(value)
 
     def poll(self):
         for _ in range(100):
@@ -731,22 +902,32 @@ class App:
                 if ENCODERS[self.encoder.get()] in ("libx264", "libx265"):
                     self.refresh_encoder_status()
             elif event == "encoder_probe":
-                probe_id, encoder, available, error = details
+                probe_id, settings, strategy, error = details
                 if probe_id == self.probe_id:
-                    self.probe_result = available, error
+                    self.probe_result = strategy is not None
                     self.gpu_status.set(
-                        "可用" if available else
-                        "不可用（请选择 Intel 或 CPU）" if encoder == "hevc_amf" else "不可用"
+                        "可用（FFmpeg 自动选卡）" if strategy and not strategy.args
+                        and settings.gpu and settings.gpu.vendor in ("Intel", "AMD") else
+                        "可用" if strategy else
+                        "不可用（可尝试 AMD H.264）" if settings.encoder == "hevc_amf" else "不可用"
                     )
+                    if strategy:
+                        self.log(f"[显卡检测] {settings.encoder} 可用：{strategy.label}。")
+                    elif error:
+                        for line in error.splitlines():
+                            self.log(f"[显卡检测] {line}")
             elif event == "current":
-                row, message = details
-                self.file_progress.set(0)
+                row, index, total, filename = details
+                self.update_file_bar(None)
                 self.table.set(row, "status", "压缩中")
-                self.status.set(message)
-                self.log(message)
+                self.status.set(f"正在准备…（{index}/{total}）")
+                self.log(f"正在处理 {index}/{total}：{filename}")
             elif event == "progress":
-                self.file_progress.set(details[0])
-                self.batch_progress.set(details[1])
+                update, overall = details
+                self.update_file_bar(update.percent if update else 0)
+                self.batch_progress.set(overall)
+                if update and self.batch and not self.batch.cancelled.is_set():
+                    self.status.set("当前文件已完成" if update.finished else update.status())
             elif event == "row":
                 self.table.set(details[0], "status", details[1])
             elif event == "result":
@@ -760,6 +941,8 @@ class App:
             elif event == "done":
                 cancelled, successes, failures, larger = details
                 self.batch = None
+                if self.file_bar.cget("mode") == "indeterminate":
+                    self.update_file_bar(0)
                 if self.closing:
                     self.root.destroy()
                     return
